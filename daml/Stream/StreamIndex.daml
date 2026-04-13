@@ -1,0 +1,68 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Stream.StreamIndex where
+
+import Daml.Finance.Interface.Types.Common.Types (Account)
+import Stream.PaymentStream (PaymentStream)
+
+-- | An index contract for a receiver, tracking all their active incoming payment streams.
+-- This contract is keyed by the receiver's account, ensuring one index per receiver.
+-- It simplifies discovery for receivers and their applications, allowing them to find
+-- all their streams in one place without querying the entire ledger for PaymentStream
+-- contracts where they are an observer.
+template StreamIndex
+  with
+    receiverAccount : Account
+      -- ^ The account of the party receiving the payment streams.
+    streams : [ContractId PaymentStream]
+      -- ^ A list of active PaymentStream contract IDs directed to the receiver.
+  where
+    signatory receiverAccount.owner
+
+    key receiverAccount : Account
+    maintainer key.owner
+
+    -- | Adds a newly created payment stream to the receiver's index.
+    -- This is typically called by an automation (e.g., a trigger) acting on
+    -- behalf of the receiver when it observes a new `PaymentStream` contract.
+    choice AddStream : ContractId StreamIndex
+      with
+        streamCid : ContractId PaymentStream
+          -- ^ The contract ID of the new stream to add.
+      controller receiverAccount.owner
+      do
+        -- Fetch the stream contract to verify that the receiver is correct.
+        stream <- fetch streamCid
+        assertMsg "The stream's receiver must match the index's receiver account"
+          (stream.receiverAccount == receiverAccount)
+
+        -- Prevent adding duplicate stream IDs.
+        assertMsg "The stream is already present in the index"
+          (not $ elem streamCid streams)
+
+        create this with streams = streamCid :: streams
+
+    -- | Removes a stream from the index.
+    -- This should be called by an automation when a stream is cancelled or
+    -- fully depleted and archived. The trigger would observe the archival
+    -- of the `PaymentStream` contract and then call this choice.
+    choice RemoveStream : ContractId StreamIndex
+      with
+        streamCid : ContractId PaymentStream
+          -- ^ The contract ID of the stream to remove.
+      controller receiverAccount.owner
+      do
+        -- Ensure the stream to be removed is actually in the index.
+        assertMsg "The stream to be removed is not present in the index"
+          (elem streamCid streams)
+
+        create this with streams = filter (/= streamCid) streams
+
+    -- | Non-consuming choice to view the list of active stream contract IDs.
+    -- This allows the receiver's UI or other logic to easily query for all
+    -- streams without needing to scan the ledger.
+    nonconsuming choice GetStreams : [ContractId PaymentStream]
+      controller receiverAccount.owner
+      do
+        return streams
