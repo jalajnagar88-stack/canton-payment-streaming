@@ -1,0 +1,167 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Stream.CancelStream where
+
+import Daml.Script
+import DA.Date
+import DA.Time
+import DA.Assert
+import DA.Math (max)
+
+import Stream.PaymentStream
+
+-- === Cancel Choice ===
+-- Extends the PaymentStream template with a choice to cancel the stream.
+-- This can only be called by the payer.
+-- It finalizes the stream, calculates any remaining accrued balance for the receiver up to the
+-- cancellation time, and determines the amount to be refunded to the payer.
+
+template instance PaymentStream with
+  choice Cancel : (ContractId PaymentStream, Decimal)
+    -- The Cancel choice allows the payer to terminate the stream before its natural end date.
+    -- It calculates the final amount accrued up to the cancellation time and determines the
+    -- unstreamed portion of the deposit to be refunded.
+    -- The choice consumes the active stream contract and creates a new, finalized one in its place.
+    --
+    -- The actual refund transfer must be handled by the caller in a separate transaction step,
+    -- allowing for composability with different payment rails (e.g., Canton CC, CBDC).
+    --
+    -- Returns: A tuple containing the ContractId of the new, inactive PaymentStream contract
+    --          and the Decimal amount to be refunded to the payer.
+    with
+      cancellationTime: Time
+        -- The timestamp at which the cancellation is effective. This is typically provided
+        -- by the ledger (`getTime`) but is an argument here for testability and precision.
+    controller payer
+    do
+      -- Pre-conditions: Ensure the stream can be cancelled.
+      assertMsg "Stream is not active" stream.isActive
+      assertMsg ("Cancellation time " <> show cancellationTime <> " must be after or at the last claim time " <> show stream.lastClaimedAt) (cancellationTime >= stream.lastClaimedAt)
+      assertMsg ("Cancellation time " <> show cancellationTime <> " cannot be after the stream's end time " <> show stream.endsAt) (cancellationTime <= stream.endsAt)
+
+      -- Determine the effective start time for this final accrual calculation.
+      -- It's the later of the stream's start or the last time funds were claimed.
+      let effectiveStartTime = max stream.startedAt stream.lastClaimedAt
+
+      -- Calculate the time delta for the final accrual period in seconds.
+      let timeDeltaSeconds = if cancellationTime > effectiveStartTime
+                                then subTime cancellationTime effectiveStartTime
+                                else 0.0
+
+      -- Calculate the amount accrued in this final period.
+      let newlyAccrued = stream.ratePerSecond * timeDeltaSeconds
+
+      -- Calculate the total amount that has been streamed over the lifetime of the stream.
+      let finalTotalStreamed = stream.totalClaimed + newlyAccrued
+
+      -- The refund is the difference between the initial deposit and the total amount streamed.
+      let refundAmount = stream.totalDeposit - finalTotalStreamed
+      assertMsg "Invariant violation: Refund amount cannot be negative." (refundAmount >= 0.0)
+
+      -- Create a finalized, inactive stream contract to preserve the final state for audit purposes.
+      -- This consumes the current active contract.
+      finalizedStreamCid <- create this with
+        isActive = False
+        totalClaimed = finalTotalStreamed
+        lastClaimedAt = cancellationTime
+
+      -- Return the ID of the new contract and the calculated refund amount.
+      return (finalizedStreamCid, refundAmount)
+
+
+-- === Test Script ===
+
+cancelStreamTest: Script ()
+cancelStreamTest = script do
+  p <- allocatePartyWithHint "Payer" (PartyIdHint "payer")
+  r <- allocatePartyWithHint "Receiver" (PartyIdHint "receiver")
+
+  let
+    startTime = time (date 2024 Jan 1) 0 0 0
+    endTime = time (date 2024 Jan 31) 23 59 59
+    totalDeposit = 2678400.0 -- 1.0 per second for 31 days (31 * 24 * 60 * 60)
+    rate = 1.0
+
+  -- Test Case 1: Simple cancellation
+  -- Payer creates a stream and cancels it partway through.
+  -- -----------------------------------------------------
+  let testId1 = "CancelStream: Simple Cancellation"
+  debug testId1
+
+  -- 1a. Payer creates the stream
+  streamCid <- submit p do
+    createCmd PaymentStream with
+      payer = p, receiver = r, ratePerSecond = rate, startedAt = startTime, endsAt = endTime
+      totalDeposit = totalDeposit, totalClaimed = 0.0, lastClaimedAt = startTime, isActive = True
+
+  -- 1b. Fast forward time to Jan 15, 2024, midnight.
+  let cancellationTime = time (date 2024 Jan 15) 0 0 0
+  setTime cancellationTime
+
+  -- 1c. Payer cancels the stream
+  (finalizedStreamCid, refund) <- submit p do
+    exerciseCmd streamCid Cancel with cancellationTime
+
+  -- 1d. Verification
+  let expectedSecondsStreamed = subTime cancellationTime startTime -- 14 days * 24 * 60 * 60 = 1_209_600 seconds
+  let expectedAmountStreamed = expectedSecondsStreamed * rate
+  let expectedRefund = totalDeposit - expectedAmountStreamed
+
+  assertMsg ("Expected refund of " <> show expectedRefund <> " but got " <> show refund) (refund == expectedRefund)
+
+  -- 1e. Check the final contract state
+  finalizedStream <- fetch finalizedStreamCid
+  assertMsg "Stream should be inactive after cancellation" (finalizedStream.isActive == False)
+  assertMsg "Final claimed amount is incorrect" (finalizedStream.totalClaimed == expectedAmountStreamed)
+  assertMsg "Last claimed at should be cancellation time" (finalizedStream.lastClaimedAt == cancellationTime)
+  debug $ testId1 <> " PASSED"
+
+
+  -- Test Case 2: Cancel after a claim
+  -- Receiver claims some funds, then payer cancels the stream later.
+  -- ---------------------------------------------------------------
+  let testId2 = "CancelStream: Cancel After Claim"
+  debug testId2
+
+  -- 2a. Create a fresh stream
+  streamCid2 <- submit p do
+    createCmd PaymentStream with
+      payer = p, receiver = r, ratePerSecond = rate, startedAt = startTime, endsAt = endTime
+      totalDeposit = totalDeposit, totalClaimed = 0.0, lastClaimedAt = startTime, isActive = True
+
+  -- 2b. Simulate the state of the stream after a claim on Jan 10.
+  -- We do this manually because the `Claim` choice is in another module, and importing it
+  -- would be architecturally unsound for this file structure. An integration test suite
+  -- would test the direct interaction.
+  let claimTime = time (date 2024 Jan 10) 0 0 0
+  let claimedAmount = subTime claimTime startTime * rate
+  let postClaimState = PaymentStream with
+      payer = p, receiver = r, ratePerSecond = rate, startedAt = startTime, endsAt = endTime
+      totalDeposit = totalDeposit, totalClaimed = claimedAmount, lastClaimedAt = claimTime, isActive = True
+
+  -- To simulate, we archive the original stream and create a new one with the post-claim state.
+  submit p do exerciseCmd streamCid2 Archive
+  claimedStreamCid_simulated <- submit p do createCmd postClaimState
+
+  -- 2c. Payer cancels the stream on Jan 20
+  let cancellationTime2 = time (date 2024 Jan 20) 0 0 0
+  setTime cancellationTime2
+
+  (finalizedStreamCid2, refund2) <- submit p do
+    exerciseCmd claimedStreamCid_simulated Cancel with cancellationTime = cancellationTime2
+
+  -- 2d. Verification
+  let secondsSinceClaim = subTime cancellationTime2 claimTime
+  let amountAccruedSinceClaim = secondsSinceClaim * rate
+  let totalStreamed = claimedAmount + amountAccruedSinceClaim
+  let expectedRefund2 = totalDeposit - totalStreamed
+
+  assertMsg ("Expected refund of " <> show expectedRefund2 <> " but got " <> show refund2) (refund2 == expectedRefund2)
+
+  finalizedStream2 <- fetch finalizedStreamCid2
+  assertMsg "Final claimed amount after claim and cancel is incorrect" (finalizedStream2.totalClaimed == totalStreamed)
+  assertMsg "Last claimed at should be cancellation time after cancel" (finalizedStream2.lastClaimedAt == cancellationTime2)
+  debug $ testId2 <> " PASSED"
+
+  return ()
