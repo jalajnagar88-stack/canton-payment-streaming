@@ -1,0 +1,88 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Stream.BudgetGuard where
+
+import Daml.Finance.Interface.Types.Common.Types (InstrumentKey)
+import Daml.Finance.Asset.Fungible (Fungible)
+import DA.Math (sum)
+import DA.Assert (assertMsg)
+import DA.Next.Set (singleton)
+
+-- | Represents a guard on a payer's total committed outflow for payment streams.
+-- This contract ensures that a payer does not create streams with a combined
+-- rate that would immediately exceed their available balance. It acts as a
+-- central tracking mechanism for a payer's total streaming liability for a
+-- specific asset (e.g., Canton CC).
+template BudgetGuard
+  with
+    payer: Party
+      -- ^ The party whose streaming budget is being guarded.
+
+    ccInstrument: InstrumentKey
+      -- ^ The instrument key for the asset being streamed (e.g., Canton CC).
+
+    totalStreamRate: Decimal
+      -- ^ The sum of rates (per second) of all active streams initiated by the payer
+      -- for the given `ccInstrument`.
+  where
+    signatory payer
+
+    key (payer, ccInstrument) : (Party, InstrumentKey)
+    maintainer key._1
+
+    -- | Increases the total tracked stream rate when a new payment stream is created.
+    -- This choice must be exercised atomically with the creation of a new `PaymentStream`
+    -- contract to ensure the budget is updated correctly. It performs a crucial check
+    -- to verify the payer has enough balance to cover at least one second of the new
+    -- total outflow rate.
+    choice IncreaseRate: ContractId BudgetGuard
+      with
+        newStreamRate: Decimal
+          -- ^ The rate per second of the new stream being added.
+      controller payer
+      do
+        assertMsg "New stream rate must be positive." (newStreamRate > 0.0)
+
+        -- Calculate the new total outflow rate per second
+        let newTotalRate = totalStreamRate + newStreamRate
+
+        -- Query for all of the payer's fungible holdings for the specified instrument.
+        -- This provides a real-time view of the payer's available balance.
+        fungibleContracts <- query @Fungible
+        let
+          payerFungibles = filter (\c -> c.instrument == ccInstrument && c.account.owner == payer) fungibleContracts
+          currentBalance = sum $ map (\c -> c.amount) payerFungibles
+
+        -- Sanity check: ensure the payer's current balance can cover at least one second
+        -- of the new total combined stream rate. This prevents creating streams that are
+        -- immediately insolvent and acts as a basic protection against over-commitment.
+        assertMsg
+          ("Insufficient balance to support the increased stream rate. " <>
+           "Required for one second: " <> show newTotalRate <> ", " <>
+           "Available balance: " <> show currentBalance)
+          (currentBalance >= newTotalRate)
+
+        -- Archive the current guard and create a new one with the updated rate.
+        create this with totalStreamRate = newTotalRate
+
+    -- | Decreases the total tracked stream rate when a payment stream is cancelled
+    -- or concludes. This choice should be exercised atomically with the archiving
+    -- of a `PaymentStream` contract.
+    choice DecreaseRate: ContractId BudgetGuard
+      with
+        rateToDecrease: Decimal
+          -- ^ The rate per second of the stream being cancelled or concluded.
+      controller payer
+      do
+        assertMsg "Stream rate to decrease must be positive." (rateToDecrease > 0.0)
+
+        let newTotalRate = totalStreamRate - rateToDecrease
+
+        assertMsg
+          ("Cannot decrease rate by " <> show rateToDecrease <>
+           ", which is more than the current total rate of " <> show totalStreamRate <> ".")
+          (newTotalRate >= 0.0)
+
+        -- Archive the current guard and create a new one with the updated rate.
+        create this with totalStreamRate = newTotalRate
