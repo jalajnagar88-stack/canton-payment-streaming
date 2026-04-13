@@ -1,0 +1,64 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Stream.ClaimAccrued where
+
+import DA.Time (Time, RelTime, diffRelTime, microseconds)
+import DA.Assert (assertMsg)
+import Stream.PaymentStream (PaymentStream)
+
+-- | Arguments for the `ClaimAccrued` choice.
+data ClaimAccruedArgs = ClaimAccruedArgs
+  with
+    claimTime : Time
+      -- ^ The timestamp at which the accrued amount is being calculated.
+      -- In a real application, this should be the ledger's record time to prevent tampering.
+  deriving (Eq, Show)
+
+-- | Helper function to calculate the number of seconds between two timestamps.
+-- The result is a Decimal to allow for precise calculations with payment rates.
+secondsBetween : Time -> Time -> Decimal
+secondsBetween t1 t2 =
+  let
+    -- diffRelTime returns the duration from the first to the second time argument.
+    -- We want a positive duration if t2 > t1.
+    duration : RelTime = diffRelTime t1 t2
+    -- Convert duration to microseconds (Int) and then to a Decimal.
+    us : Decimal = convert @Decimal $ microseconds duration
+  in
+    -- Divide by 1,000,000.0 to get seconds.
+    us / 1_000_000.0
+
+-- | Adds a non-consuming choice to the `PaymentStream` template that allows the
+-- receiver to calculate the amount accrued since the last claim. This is useful
+-- for querying the current claimable balance without altering the stream's state.
+--
+-- A separate consuming choice would be needed to actually perform the claim,
+-- which would involve transferring funds and updating the `lastClaimedAt` timestamp
+-- on the `PaymentStream` contract.
+nonconsuming choice PaymentStream.ClaimAccrued : Decimal
+  with
+    args: ClaimAccruedArgs
+      -- ^ The arguments for the claim calculation, including the current time.
+  controller this.receiver
+    -- ^ Only the receiver of the stream can calculate their accrued amount.
+  do
+    -- A claim cannot be calculated for a time before the last claim was made.
+    assertMsg "Claim time cannot be before the last claim timestamp."
+      (args.claimTime >= this.lastClaimedAt)
+
+    -- The stream stops accruing funds at `streamEndsAt`. We cap the calculation
+    -- at that time to ensure no funds accrue beyond the stream's intended duration.
+    let effectiveClaimTime = min args.claimTime this.streamEndsAt
+
+    -- Calculate the number of seconds that have passed since the last claim,
+    -- up to the effective (capped) claim time.
+    let elapsedSeconds = secondsBetween this.lastClaimedAt effectiveClaimTime
+
+    -- The accrued amount is the stream's rate per second multiplied by the elapsed seconds.
+    let accruedAmount = this.ratePerSecond * elapsedSeconds
+
+    -- Sanity check to ensure the calculation doesn't result in a negative amount.
+    assertMsg "Accrued amount cannot be negative." (accruedAmount >= 0.0)
+
+    return accruedAmount
