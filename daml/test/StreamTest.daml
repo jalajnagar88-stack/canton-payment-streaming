@@ -1,0 +1,226 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module StreamTest where
+
+import Daml.Script
+import DA.Date hiding (Month)
+import DA.Time
+import DA.Assert
+import DA.Numeric ((%))
+import DA.Text (show)
+
+import Stream.PaymentStream
+import Stream.StreamIndex
+import Stream.BudgetGuard
+
+-- | Test suite for the entire payment stream lifecycle.
+streamLifecycleTest: Script ()
+streamLifecycleTest = script do
+  -- === Parties ===
+  payer <- allocatePartyWithHint "Payer" (PartyIdHint "payer")
+  receiver <- allocatePartyWithHint "Receiver" (PartyIdHint "receiver")
+
+  -- === Time and Parameters ===
+  startTime <- getTime
+  let
+    -- Stream for 30 days
+    streamDuration = days 30
+    endDate = addRelTime startTime streamDuration
+    -- Rate of 1.0 unit per second
+    ratePerSecond = 1.0
+    -- Total budget calculated from rate and duration
+    totalBudget = ratePerSecond * intToDecimal (relTimeToSeconds streamDuration)
+    streamId = "test-stream-001"
+
+  -- === 1. Setup: Payer creates a BudgetGuard and StreamIndex ===
+  debug $ "Setting up stream with budget: " <> show totalBudget
+  budgetGuardCid <- submit payer do
+    createCmd BudgetGuard with payer, receiver, initialBudget = totalBudget, remainingBudget = totalBudget
+
+  streamIndexCid <- submit payer do
+    createCmd StreamIndex with payer, receiver, streamId
+
+  -- === 2. Create Stream: Payer proposes, Receiver accepts ===
+  debug "Creating stream..."
+  streamProposalCid <- submit payer do
+    createCmd PaymentStreamProposal with
+      payer, receiver, streamId, ratePerSecond, startTime, endDate, budgetGuardCid, streamIndexCid
+
+  streamCid <- submit receiver do
+    exerciseCmd streamProposalCid Accept
+
+  -- Fetch the initial stream contract to check its state
+  initialStream <- queryContractId receiver streamCid
+  initialStream.lastClaimedAt === startTime
+  initialStream.totalClaimed === 0.0
+
+  -- === 3. First Claim: Receiver claims after 10 days ===
+  let
+    claimTime1 = addRelTime startTime (days 10)
+    expectedAccrual1 = ratePerSecond * intToDecimal (relTimeToSeconds (days 10))
+
+  debug $ "Advancing time by 10 days to " <> show claimTime1
+  setTime claimTime1
+
+  debug $ "Receiver making first claim. Expected amount: " <> show expectedAccrual1
+  (newStreamCid1, claimedAmount1) <- submit receiver do
+    exerciseCmd streamCid ClaimAccrued with now = claimTime1
+
+  -- Assertions for the first claim
+  claimedAmount1 === expectedAccrual1
+  streamAfterClaim1 <- queryContractId receiver newStreamCid1
+  streamAfterClaim1.lastClaimedAt === claimTime1
+  streamAfterClaim1.totalClaimed === expectedAccrual1
+
+  budgetGuardAfterClaim1 <- queryContractId payer budgetGuardCid
+  budgetGuardAfterClaim1.remainingBudget === totalBudget - expectedAccrual1
+
+  -- === 4. Second Claim: Receiver claims after another 15 days (total 25 days) ===
+  let
+    claimTime2 = addRelTime claimTime1 (days 15)
+    accrualDuration2 = diffRelTime claimTime2 claimTime1
+    expectedAccrual2 = ratePerSecond * intToDecimal (relTimeToSeconds accrualDuration2)
+    totalExpectedClaimed = expectedAccrual1 + expectedAccrual2
+
+  debug $ "Advancing time by another 15 days to " <> show claimTime2
+  setTime claimTime2
+
+  debug $ "Receiver making second claim. Expected amount: " <> show expectedAccrual2
+  (newStreamCid2, claimedAmount2) <- submit receiver do
+    exerciseCmd newStreamCid1 ClaimAccrued with now = claimTime2
+
+  -- Assertions for the second claim
+  claimedAmount2 === expectedAccrual2
+  streamAfterClaim2 <- queryContractId receiver newStreamCid2
+  streamAfterClaim2.lastClaimedAt === claimTime2
+  assert $ abs(streamAfterClaim2.totalClaimed - totalExpectedClaimed) < 1.0e-10
+
+  budgetGuardAfterClaim2 <- queryContractId payer budgetGuardCid
+  assert $ abs(budgetGuardAfterClaim2.remainingBudget - (totalBudget - totalExpectedClaimed)) < 1.0e-10
+
+  -- === 5. Cancel Stream: Payer cancels after another 2 days (total 27 days) ===
+  let
+    cancelTime = addRelTime claimTime2 (days 2)
+    finalAccrualDuration = diffRelTime cancelTime claimTime2
+    finalAccrual = ratePerSecond * intToDecimal (relTimeToSeconds finalAccrualDuration)
+    totalAccruedAtCancel = totalExpectedClaimed + finalAccrual
+    expectedRefund = totalBudget - totalAccruedAtCancel
+
+  debug $ "Advancing time by another 2 days to " <> show cancelTime
+  setTime cancelTime
+
+  debug "Payer cancelling the stream."
+  (finalPayment, refundAmount) <- submit payer do
+    exerciseCmd newStreamCid2 CancelStream with now = cancelTime
+
+  -- Assertions for cancellation
+  debug $ "Final payment to receiver: " <> show finalPayment <> ". Expected: " <> show finalAccrual
+  assert $ abs(finalPayment - finalAccrual) < 1.0e-10
+
+  debug $ "Refund to payer: " <> show refundAmount <> ". Expected: " <> show expectedRefund
+  assert $ abs(refundAmount - expectedRefund) < 1.0e-10
+
+  -- Verify contracts are archived
+  debug "Verifying stream and index contracts are archived."
+  queryContractId payer streamIndexCid >>= \_ -> abort "StreamIndex should be archived"
+    `catch` \(_ : Can'tFetchContract) -> return ()
+
+  queryContractId receiver newStreamCid2 >>= \_ -> abort "PaymentStream should be archived"
+    `catch` \(_ : Can'tFetchContract) -> return ()
+
+  queryContractId payer budgetGuardCid >>= \_ -> abort "BudgetGuard should be archived"
+    `catch` \(_ : Can'tFetchContract) -> return ()
+
+  debug "Stream lifecycle test completed successfully."
+
+-- | Test that a claim fails if it's attempted before the stream's start time.
+testClaimBeforeStartFails: Script ()
+testClaimBeforeStartFails = script do
+  payer <- allocatePartyWithHint "PayerFail" (PartyIdHint "payer-fail")
+  receiver <- allocatePartyWithHint "ReceiverFail" (PartyIdHint "receiver-fail")
+
+  currentTime <- getTime
+  let
+    startTime = addRelTime currentTime (minutes 10)
+    endDate = addRelTime startTime (days 1)
+    streamId = "fail-stream-before-start"
+
+  budgetGuardCid <- submit payer do createCmd BudgetGuard with payer, receiver, initialBudget = 1000.0, remainingBudget = 1000.0
+  streamIndexCid <- submit payer do createCmd StreamIndex with payer, receiver, streamId
+  proposalCid <- submit payer do createCmd PaymentStreamProposal with payer, receiver, streamId, ratePerSecond=1.0, startTime, endDate, budgetGuardCid, streamIndexCid
+  streamCid <- submit receiver do exerciseCmd proposalCid Accept
+
+  debug $ "Attempting to claim at " <> show currentTime <> " which is before start time " <> show startTime
+  submitMustFail receiver do
+    exerciseCmd streamCid ClaimAccrued with now = currentTime
+
+  debug "testClaimBeforeStartFails completed successfully."
+
+-- | Test that a claim after the stream's end date accrues funds only up to the end date.
+testClaimAfterEnd: Script ()
+testClaimAfterEnd = script do
+  payer <- allocatePartyWithHint "PayerEnd" (PartyIdHint "payer-end")
+  receiver <- allocatePartyWithHint "ReceiverEnd" (PartyIdHint "receiver-end")
+
+  startTime <- getTime
+  let
+    duration = hours 1
+    endDate = addRelTime startTime duration
+    ratePerSecond = 10.0
+    totalBudget = ratePerSecond * intToDecimal (relTimeToSeconds duration)
+    streamId = "end-stream-1"
+
+  budgetGuardCid <- submit payer do createCmd BudgetGuard with payer, receiver, initialBudget = totalBudget, remainingBudget = totalBudget
+  streamIndexCid <- submit payer do createCmd StreamIndex with payer, receiver, streamId
+  proposalCid <- submit payer do createCmd PaymentStreamProposal with payer, receiver, streamId, ratePerSecond, startTime, endDate, budgetGuardCid, streamIndexCid
+  streamCid <- submit receiver do exerciseCmd proposalCid Accept
+
+  -- Advance time to be after the stream has ended
+  let claimTime = addRelTime endDate (minutes 5)
+  setTime claimTime
+  debug $ "Attempting to claim at " <> show claimTime <> " which is after end time " <> show endDate
+
+  -- Claim the accrued amount. It should be capped at the total stream value.
+  (newStreamCid, claimedAmount) <- submit receiver do
+    exerciseCmd streamCid ClaimAccrued with now = claimTime
+
+  claimedAmount === totalBudget
+
+  streamAfterClaim <- queryContractId receiver newStreamCid
+  -- lastClaimedAt should be capped at the endDate
+  streamAfterClaim.lastClaimedAt === endDate
+  streamAfterClaim.totalClaimed === totalBudget
+
+  debug "testClaimAfterEnd completed successfully."
+
+
+-- | Test that cancelling a stream before it starts refunds the entire budget.
+testCancelBeforeStart: Script ()
+testCancelBeforeStart = script do
+  payer <- allocatePartyWithHint "PayerCancel" (PartyIdHint "payer-cancel")
+  receiver <- allocatePartyWithHint "ReceiverCancel" (PartyIdHint "receiver-cancel")
+
+  currentTime <- getTime
+  let
+    startTime = addRelTime currentTime (hours 1)
+    endDate = addRelTime startTime (days 1)
+    totalBudget = 1000.0
+    streamId = "cancel-before-start"
+
+  budgetGuardCid <- submit payer do createCmd BudgetGuard with payer, receiver, initialBudget = totalBudget, remainingBudget = totalBudget
+  streamIndexCid <- submit payer do createCmd StreamIndex with payer, receiver, streamId
+  proposalCid <- submit payer do createCmd PaymentStreamProposal with payer, receiver, streamId, ratePerSecond=1.0, startTime, endDate, budgetGuardCid, streamIndexCid
+  streamCid <- submit receiver do exerciseCmd proposalCid Accept
+
+  debug $ "Cancelling stream at " <> show currentTime <> " before it starts at " <> show startTime
+  (finalPayment, refundAmount) <- submit payer do
+    exerciseCmd streamCid CancelStream with now = currentTime
+
+  finalPayment === 0.0
+  refundAmount === totalBudget
+
+  debug "testCancelBeforeStart completed successfully."
+
+relTimeToSeconds: RelTime -> Int
+relTimeToSeconds rt = microSecondsToSeconds (relTimeToMicroseconds rt)
