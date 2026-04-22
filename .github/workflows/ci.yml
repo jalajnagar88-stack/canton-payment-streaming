@@ -1,0 +1,27 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  build-and-test:
+    name: Build and Test Daml Contracts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install DPM (Daml Package Manager)
+        run: curl https://get.digitalasset.com/install/install.sh | sh
+
+      - name: Add DPM to workflow PATH
+        run: echo "$HOME/.dpm/bin" >> $GITHUB_PATH
+
+      - name: Build Daml project
+        # This command will discover the daml.yaml or multi-package.yaml
+        # and compile the Daml source into a distributable DAR file.
+        run: dpm build
+
+      - name: Run Daml Script tests
+        # This command will discover and run all tests defined
+        # using Daml Script in the project.
+        run: dpm test
