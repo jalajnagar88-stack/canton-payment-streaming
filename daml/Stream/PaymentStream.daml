@@ -4,138 +4,123 @@
 module Stream.PaymentStream where
 
 import Daml.Script
-import DA.Time (Time, getTime, addRelTime, relTime, timeToUnixSeconds)
-import DA.Assert (assertMsg)
+import DA.Time
+import DA.Assert
 
--- | Type synonym for clarity, representing the rate of payment flow per second.
-type RatePerSecond = Decimal
+import Stream.BudgetGuard (BudgetGuard)
+import Stream.StreamIndex (StreamIndex)
+import Stream.ClaimAccrued (ClaimAccruedArgs)
+import Stream.CancelStream (CancelStreamArgs)
+
+-- | Defines the status of a payment stream.
+data StreamStatus = Active | Paused
+  deriving (Eq, Show, Ord)
 
 -- | Represents a continuous payment stream from a payer to a receiver.
--- This agreement is private between the two parties. It defines the parameters
--- of the stream, and its choices govern the lifecycle events like claiming funds
--- or canceling the stream. The contract itself does not hold funds; it serves as
--- the authoritative state for calculating entitlements. An external process
--- (e.g., a trigger or UI) is expected to orchestrate the actual asset transfers
--- based on the results of exercising choices on this contract.
+-- The stream accrues value second-by-second and can be claimed by the receiver at any time.
+-- The rate and parties are private, only visible to the payer and receiver.
+-- This template now includes a pause/resume mechanism for subscription-like control.
 template PaymentStream
   with
     payer: Party
       -- ^ The party funding the stream.
     receiver: Party
       -- ^ The party receiving the funds.
-    streamRatePerSecond: RatePerSecond
-      -- ^ The amount of value that accrues to the receiver per second.
+    streamRatePerSecond: Decimal
+      -- ^ The rate at which value accrues, per second.
     startTime: Time
-      -- ^ The UTC timestamp from which the stream starts accruing value.
-    endTime: Time
-      -- ^ The UTC timestamp at which the stream stops accruing value.
-    totalBudget: Decimal
-      -- ^ The maximum total amount that can be streamed. The stream stops if
-      -- this budget is exhausted, even if `endTime` has not been reached.
-    claimedAmount: Decimal
-      -- ^ The cumulative amount that has already been claimed by the receiver.
+      -- ^ The timestamp when the stream began accruing.
+    endTime: Optional Time
+      -- ^ The optional timestamp when the stream will automatically stop.
+    status: StreamStatus
+      -- ^ The current status of the stream (Active or Paused).
+    lastStatusChangeTime: Time
+      -- ^ The timestamp of the last status change (create, pause, resume, claim).
+    totalAccruedAtLastChange: Decimal
+      -- ^ The total amount accrued up to `lastStatusChangeTime`.
+    totalClaimed: Decimal
+      -- ^ The total amount claimed by the receiver so far.
+    budgetGuardCid: ContractId BudgetGuard
+      -- ^ Contract ID for the budget guard, ensuring funds aren't overdrawn.
+    streamIndexCid: ContractId StreamIndex
+      -- ^ Contract ID for the stream index, used for discoverability.
+
   where
     signatory payer, receiver
 
-    ensure
-      -- Basic sanity checks to ensure the stream is created with valid parameters.
-      startTime < endTime &&
-      streamRatePerSecond > 0.0 &&
-      totalBudget > 0.0 &&
-      claimedAmount >= 0.0 &&
-      claimedAmount <= totalBudget &&
-      payer /= receiver
+    key (payer, receiver, streamIndexCid) : (Party, Party, ContractId StreamIndex)
+    maintainer key._1
 
-    -- Helper function to calculate the current state of the stream's accrual.
-    -- It is parameterized by `currentTime` to allow for consistent calculations
-    -- within a single transaction.
-    -- Returns a tuple containing:
-    --   1. `cappedTotalAccrued`: The total amount that should have accrued by `currentTime`.
-    --   2. `claimableNow`: The portion of the accrued amount not yet claimed.
-    --   3. `budgetRemaining`: The portion of the `totalBudget` left after accounting for total accrual.
-    let calculateAccrual (currentTime: Time): (Decimal, Decimal, Decimal) =
-          -- The stream only accrues up to the earlier of the current time or its defined end time.
-          let effectiveEndTime = min currentTime endTime
+    -- | Helper function to calculate the total accrued amount at a given point in time.
+    -- This does not advance time but calculates based on a given 'now' timestamp.
+    method calculateAccrued(now: Time): Decimal = do
+      -- Respect the stream's end time, if one is set.
+      let effectiveNow = case endTime of
+            None -> now
+            Some et -> min et now
 
-          -- Calculate the duration in seconds since the stream started. We use Unix seconds
-          -- which provides whole-second precision.
-          let durationSeconds =
-                if effectiveEndTime < startTime then
-                  0
-                else
-                  timeToUnixSeconds effectiveEndTime - timeToUnixSeconds startTime
+      -- Ensure we don't calculate accrual for a time before the last status change.
+      let clampedEffectiveNow = max effectiveNow lastStatusChangeTime
 
-          -- Total value accrued over the duration.
-          let totalAccrued = streamRatePerSecond * intToDecimal durationSeconds
-          -- The accrued amount cannot exceed the total budget.
-          let cappedTotalAccrued = min totalAccrued totalBudget
+      let newlyAccrued = if status == Active
+            then
+              let duration = relTime clampedEffectiveNow lastStatusChangeTime
+              in toSeconds duration * streamRatePerSecond
+            else
+              0.0
+      totalAccruedAtLastChange + newlyAccrued
 
-          -- The amount that can be claimed now is what's accrued minus what's already been paid.
-          let claimableNow = cappedTotalAccrued - claimedAmount
+    -- | Pause the stream. Accrual will stop until the stream is resumed.
+    -- This is useful for managing subscriptions or pausing services.
+    choice PauseStream: ContractId PaymentStream
+      with
+        now: Time
+          -- ^ The current time, used to calculate accrual up to the pause point.
+      controller payer
+      do
+        assertMsg "Stream must be active to be paused" (self.status == Active)
+        assertMsg "Pause time must be after the last status change" (now > self.lastStatusChangeTime)
 
-          -- The budget remaining after this potential accrual.
-          let budgetRemaining = totalBudget - cappedTotalAccrued
+        -- Calculate amount accrued since the last event
+        let newTotalAccrued = calculateAccrued now
 
-          (cappedTotalAccrued, claimableNow, budgetRemaining)
+        -- Recreate the stream in a 'Paused' state
+        create this with
+          status = Paused
+          lastStatusChangeTime = now
+          totalAccruedAtLastChange = newTotalAccrued
 
-    -- | The `receiver` can claim the currently accrued amount. This action does not
-    -- terminate the stream. It updates the `claimedAmount` and continues.
-    -- The choice returns the `ContractId` of the updated stream contract and the
-    -- `Decimal` amount that should be transferred to the receiver off-ledger or
-    -- via a separate token transfer.
-    choice Claim: (ContractId PaymentStream, Decimal)
+    -- | Resume a paused stream. Accrual will restart from the current time.
+    choice ResumeStream: ContractId PaymentStream
+      with
+        now: Time
+          -- ^ The current time, from which accrual will resume.
+      controller payer
+      do
+        assertMsg "Stream must be paused to be resumed" (self.status == Paused)
+        assertMsg "Resume time must be after the last status change" (now > self.lastStatusChangeTime)
+
+        -- Recreate the stream in an 'Active' state
+        -- totalAccruedAtLastChange remains the same as no value accrues while paused.
+        create this with
+          status = Active
+          lastStatusChangeTime = now
+
+    -- Non-consuming choices that delegate to other modules for implementation.
+    -- This pattern keeps the main template clean and promotes modularity.
+    -- The StreamIndex contract acts as the public entry point for these actions.
+
+    nonconsuming choice ClaimAccrued: ContractId PaymentStream
+      with
+        args: ClaimAccruedArgs
       controller receiver
       do
-        now <- getTime
-        let (_, claimable, _) = calculateAccrual now
-        assertMsg "No funds to claim at this time" (claimable > 0.0)
+        exercise self.streamIndexCid ClaimAccrued with args
 
-        -- The stream state is updated by archiving the old contract and creating a new
-        -- one with the new `claimedAmount`. This is the standard Daml state update pattern.
-        newStreamCid <- create this with
-          claimedAmount = this.claimedAmount + claimable
-
-        return (newStreamCid, claimable)
-
-    -- | Either the `payer` or the `receiver` can cancel the stream at any time.
-    -- This action terminates the stream. It returns a tuple indicating the final
-    -- payment due to the receiver and the refund due to the payer.
-    choice Cancel: (Decimal, Decimal)
+    nonconsuming choice CancelStream: ()
+      with
+        args: CancelStreamArgs
+      -- Either party can cancel the stream.
       controller payer, receiver
       do
-        now <- getTime
-        let (_, finalPayoutToReceiver, refundToPayer) = calculateAccrual now
-        return (finalPayoutToReceiver, refundToPayer)
-
--- | A Daml Script to demonstrate the creation of a `PaymentStream` contract.
--- This can be run using `dpm test --files daml/Stream/PaymentStream.daml`.
-setup: Script (ContractId PaymentStream)
-setup = script do
-  payer <- allocatePartyWithHint "Payer" (PartyIdHint "payer")
-  receiver <- allocatePartyWithHint "Receiver" (PartyIdHint "receiver")
-
-  now <- getTime
-
-  let
-    -- The stream starts now.
-    startTime = now
-    -- The stream is configured to last for 5 minutes.
-    endTime = addRelTime now (relTime 0 5 0)
-    -- The stream flows at a rate of 0.1 units per second.
-    rate = 0.1
-    -- The total budget is calculated for the full 5-minute duration (300 seconds).
-    budget = rate * 300.0
-
-  -- The contract is a bilateral agreement, so both parties must be signatories
-  -- on the create command. `submitMulti` is used for this purpose.
-  cid <- submitMulti [payer, receiver] [] do
-    createCmd PaymentStream with
-      payer
-      receiver
-      streamRatePerSecond = rate
-      startTime
-      endTime
-      totalBudget = budget
-      claimedAmount = 0.0
-
-  return cid
+        exercise self.streamIndexCid CancelStream with args
